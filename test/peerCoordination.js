@@ -14,6 +14,8 @@ let nPeers = 3;
 let peers = [];
 let keyNames = ["first", "second", "third" ];
 
+let maxJobsPerPeer = 3;
+
 for(let i=0,lastPort=26780; i<nPeers; i++,lastPort=(26780+i-1)) {
   let options = {
     'port': (26780 + i),
@@ -52,7 +54,11 @@ var broadcastTake = (peer, jobs) => {
     };
   }
   
-  peer.jobs = jobs;
+  if(!peer.jobs || !Array.isArray(peer.jobs)) {
+    peer.jobs = jobs; 
+  } else {
+    peer.jobs = peer.jobs.concat(jobs); 
+  }
   
   let takeMessage = new PeerMessage({
     'type': 'take',
@@ -93,7 +99,8 @@ var takeHandler = (peer, { message, connection }) => {
         for(let j=peer.jobs.length-1; j>=0; j--) {
           if(JSON.stringify(message.body.jobs[i]) == JSON.stringify(peer.jobs[j].job)) {
             found = true;
-            let difference = (message.body.timestamp - peer.jobs[j].enqueued);
+            
+            let difference = (message.body.timestamp - peer.jobs[i].enqueued);
             
             if(difference > 0) {
               // Job ${message.body.jobs[i]} DOES conflict and will be DROPPED!
@@ -139,7 +146,7 @@ var takeHandler = (peer, { message, connection }) => {
   console.log(`\t${peer.port} is sending 'takeResult' ` + 
       `message back to peer: ${takeResultMessage}`);
   
-  peer.broadcast(takeResultMessage, connection);
+  peer.broadcast({ 'message': takeResultMessage, connection });
 };
 
 var takeResultHandler = (peer, { message, connection }) => {
@@ -177,7 +184,15 @@ var takeResultHandler = (peer, { message, connection }) => {
         console.log(`\t${peer.port} has received all necessary `+
           `responses for job and will begin processing: ${peer.jobs[j].job}`);
         
-        processJob(peer.jobs.splice(j,1)[0].job);
+        return processJob(peer.jobs[j].job)
+          .then((job) => {
+            for(let k=peer.jobs.length-1; k>=0; k--) {
+              if(JSON.stringify(job) == JSON.stringify(peer.jobs[k].job)) {
+                peer.jobs.splice(k,1);
+                break;
+              }
+            }
+          });
       } else {
         console.log(`\t${peer.port} has received all necessary `+
           `responses for job but job was dropped by one or more peers; dropping job.`);
@@ -189,15 +204,21 @@ var takeResultHandler = (peer, { message, connection }) => {
 };
 
 var processJob = (job) => {
-  setTimeout(() => {
-    for(let i=sharedQueue.length-1; i>=0; i--) {
-      if(JSON.stringify(sharedQueue[i]) == JSON.stringify(job)) {
-        console.log(`Job ${job} completed, removing it from the queue.`);
-        sharedQueue.splice(i,1);
-        console.log(`New sharedQueue: [ ${sharedQueue} ]`);
+  return new Promise((success, failure) => {
+    setTimeout(() => {
+      for(let i=sharedQueue.length-1; i>=0; i--) {
+        if(JSON.stringify(sharedQueue[i]) == JSON.stringify(job)) {
+          console.log(`Job ${job} completed, removing it from the queue.`);
+          sharedQueue.splice(i,1);
+          console.log(`New sharedQueue: [ ${sharedQueue} ]`);
+          
+          break;
+        }
       }
-    }
-  }, 20000);
+      
+      return success(job);
+    }, parseInt(Math.floor(Math.random()*90000)));
+  });
 };
 
 
@@ -211,26 +232,47 @@ var loop = (peer) => {
     return success(sharedQueue);
   })
   .then(results => {
+    if(peer.jobs && Array.isArray(peer.jobs) && peer.jobs.length >= maxJobsPerPeer) {
+      console.log(`${peer.port} already has max allowed jobs in queue (${peer.jobs.length}).`);
+      console.log(`Skipping work loop cycle and will continue work when queue frees up.`);
+      
+      return Promise.resolve();
+    }
+    
     if(results && Array.isArray(results) && results.length > 0) {
       // Only choose a single job to process
       let rNum = parseInt(Math.floor(Math.random()*results.length));
       let singleJob = results.slice(rNum, rNum+1);
       
+      if(peer.jobs && Array.isArray(peer.jobs) && peer.jobs.length > 0) {
+        for(let i=0; i<peer.jobs.length; i++) {
+          if(JSON.stringify(peer.jobs[i].job) == JSON.stringify(singleJob[0])) {
+            console.log(`${peer.port} is already working on job ${singleJob[0]}.`);
+            console.log(`Skipping work loop cycle so as to prevent duplicate work.`);
+            
+            return Promise.resolve();
+          }
+        }
+      }
+      
       console.log(`${peer.port} will ` + 
         `request to take job: ${singleJob}`);
       
+      // Broadcasting the 'take' message will start our work
       broadcastTake(peer, singleJob);
+      
       return Promise.resolve();
     } else {
       return Promise.resolve();
     }
   })
   .catch(e => {
+    console.error(e);
     console.error(`Loop error: ${JSON.stringify(e)}`);
   }).then(() => {
     return new Promise((success, failure) => {
       // Psuedo-random delay anywhere from 30s to 60s
-      let timeout = 30000 + (parseInt(Math.floor(Math.random()*30000)));
+      let timeout = 5000 + (parseInt(Math.floor(Math.random()*5000)));
       console.log(`continuing loop in ${timeout}ms`);
       
       setTimeout(() => {
